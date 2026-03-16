@@ -1,4 +1,5 @@
 mod dashboard;
+mod metrics;
 mod session;
 mod ssh_config;
 mod ui;
@@ -8,6 +9,7 @@ use std::io;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use dashboard::Dashboard;
+use metrics::MetricType;
 use session::SessionState;
 use ssh_config::parse_ssh_config;
 
@@ -130,6 +132,10 @@ fn handle_input(
             KeyCode::Left | KeyCode::Char('h') => dashboard.move_left(),
             KeyCode::Right | KeyCode::Char('l') => dashboard.move_right(),
             KeyCode::Enter => dashboard.focus(rt.handle()),
+            KeyCode::Tab => dashboard.cycle_metric(),
+            KeyCode::Char('1') => dashboard.set_metric(MetricType::Cpu),
+            KeyCode::Char('2') => dashboard.set_metric(MetricType::Memory),
+            KeyCode::Char('3') => dashboard.set_metric(MetricType::Network),
             _ => {}
         }
     }

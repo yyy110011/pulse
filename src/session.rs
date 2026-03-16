@@ -5,6 +5,7 @@ use russh::client;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::ChannelMsg;
 
+use crate::metrics::{self, MetricsData};
 use crate::ssh_config::SshHost;
 
 /// State of an SSH session.
@@ -42,6 +43,8 @@ pub struct SessionData {
     pub host: SshHost,
     /// Channel for sending input to the remote PTY.
     pub input_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// Real-time system metrics collected over SSH.
+    pub metrics: MetricsData,
 }
 
 impl SessionData {
@@ -51,10 +54,12 @@ impl SessionData {
             screen: vt100::Parser::new(rows, cols, 200),
             host,
             input_tx: None,
+            metrics: MetricsData::new(),
         }
     }
 
     /// Get a snapshot of the screen contents (for mini-preview in tiles).
+    #[allow(dead_code)]
     pub fn screen_lines(&self, max_lines: usize) -> Vec<String> {
         let screen = self.screen.screen();
         let rows = screen.size().0 as usize;
@@ -72,7 +77,7 @@ impl SessionData {
 pub type SharedSession = Arc<Mutex<SessionData>>;
 
 /// SSH client handler for russh.
-struct SshClientHandler;
+pub struct SshClientHandler;
 
 impl client::Handler for SshClientHandler {
     type Error = russh::Error;
@@ -90,15 +95,16 @@ pub fn spawn_session(
     session_data: SharedSession,
     rt: tokio::runtime::Handle,
 ) {
+    let rt_clone = rt.clone();
     rt.spawn(async move {
-        if let Err(e) = run_session(session_data.clone()).await {
+        if let Err(e) = run_session(session_data.clone(), rt_clone).await {
             let mut data = session_data.lock().await;
             data.state = SessionState::Disconnected(format!("{e}"));
         }
     });
 }
 
-async fn run_session(session_data: SharedSession) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_session(session_data: SharedSession, rt: tokio::runtime::Handle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (host_name, port, user, identity_file) = {
         let data = session_data.lock().await;
         let h = data.host.clone();
@@ -171,6 +177,12 @@ async fn run_session(session_data: SharedSession) -> Result<(), Box<dyn std::err
         .await?;
     channel.request_shell(false).await?;
 
+    // Wrap session handle in Arc<Mutex> so the metrics collector can share it
+    let shared_handle = Arc::new(Mutex::new(session));
+
+    // Spawn metrics collector on separate channels
+    metrics::spawn_metrics_collector(shared_handle, session_data.clone(), rt);
+
     // Set up input channel
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     {
@@ -212,7 +224,6 @@ async fn run_session(session_data: SharedSession) -> Result<(), Box<dyn std::err
         data.state = SessionState::Disconnected("Session ended".to_string());
     }
 
-    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "en").await;
     Ok(())
 }
 

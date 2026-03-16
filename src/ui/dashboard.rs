@@ -2,11 +2,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Sparkline, Wrap},
     Frame,
 };
 
 use crate::dashboard::Dashboard;
+use crate::metrics::MetricType;
 use crate::session::SessionState;
 
 /// Draw the dashboard view.
@@ -66,9 +67,10 @@ fn draw_grid(frame: &mut Frame, dashboard: &Dashboard, rt: &tokio::runtime::Hand
     }
 
     // Status bar
+    let metric_label = dashboard.active_metric.to_string();
     let status = Line::from(vec![
         Span::styled(
-            " ↑↓←→ Navigate  Enter Focus  q Quit",
+            format!(" ↑↓←→ Navigate  Enter Focus  Tab/{metric_label}  1 CPU  2 MEM  3 NET  q Quit"),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -132,11 +134,55 @@ fn draw_tile(
     // Content inside the tile
     let content_lines = match &data.state {
         SessionState::Connected => {
-            let preview = data.screen_lines(inner.height as usize);
-            preview
-                .into_iter()
-                .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::White))))
-                .collect::<Vec<_>>()
+            let metric = dashboard.active_metric;
+            let series = data.metrics.series(metric);
+            let latest = data.metrics.latest(metric);
+
+            let metric_color = match metric {
+                MetricType::Cpu => Color::Cyan,
+                MetricType::Memory => Color::Magenta,
+                MetricType::Network => Color::Yellow,
+            };
+
+            // Header: metric name + current value
+            let value_str = match latest {
+                Some(v) => {
+                    if matches!(metric, MetricType::Network) {
+                        format!("{:.1} KB/s", v)
+                    } else {
+                        format!("{:.0}%", v)
+                    }
+                }
+                None => "--".to_string(),
+            };
+
+            let header = Line::from(vec![
+                Span::styled(
+                    format!("{metric} "),
+                    Style::default().fg(metric_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    value_str,
+                    Style::default().fg(Color::White),
+                ),
+            ]);
+            let header_paragraph = Paragraph::new(header);
+
+            // Split inner area: 1 line for header, rest for sparkline
+            let inner_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(inner);
+
+            frame.render_widget(header_paragraph, inner_chunks[0]);
+
+            // Convert VecDeque<f64> to Vec<u64> for Sparkline
+            let spark_data: Vec<u64> = series.iter().map(|v| *v as u64).collect();
+            let sparkline = Sparkline::default()
+                .data(&spark_data)
+                .style(Style::default().fg(metric_color));
+            frame.render_widget(sparkline, inner_chunks[1]);
+            return; // We've rendered the tile contents manually
         }
         SessionState::NeedPassword => {
             vec![

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::metrics::MetricType;
 use crate::session::{self, SessionData, SharedSession};
 use crate::ssh_config::SshHost;
 
@@ -20,6 +21,8 @@ pub struct Dashboard {
     /// Full terminal dimensions (for creating sessions with correct size).
     pub term_cols: u16,
     pub term_rows: u16,
+    /// Which metric to display in tile sparklines.
+    pub active_metric: MetricType,
 }
 
 impl Dashboard {
@@ -44,6 +47,7 @@ impl Dashboard {
             entering_password: false,
             term_cols,
             term_rows,
+            active_metric: MetricType::Cpu,
         }
     }
 
@@ -133,5 +137,15 @@ impl Dashboard {
         }
         self.password_input.clear();
         self.entering_password = false;
+    }
+
+    /// Cycle active metric: CPU → Mem → Net → CPU.
+    pub fn cycle_metric(&mut self) {
+        self.active_metric = self.active_metric.next();
+    }
+
+    /// Set metric directly.
+    pub fn set_metric(&mut self, metric: MetricType) {
+        self.active_metric = metric;
     }
 }
