@@ -83,20 +83,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "ar-ssh-cli"
-version = "0.1.0"
-dependencies = [
- "color-eyre",
- "ratatui",
- "russh",
- "russh-keys",
- "ssh-key",
- "tokio",
- "vt100",
- "whoami",
-]
-
-[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2204,6 +2190,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulse"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "ratatui",
+ "russh",
+ "russh-keys",
+ "ssh-key",
+ "tokio",
+ "vt100",
+ "whoami",
 ]
 
 [[package]]
