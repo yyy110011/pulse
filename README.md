@@ -24,6 +24,14 @@ Real-time SSH fleet monitoring TUI — CPU, Memory, and Network sparklines acros
 ## Install
 
 ```bash
+cargo install beebo
+```
+
+### From source
+
+```bash
+git clone https://github.com/yyy110011/beebo.git
+cd beebo
 cargo install --path .
 ```
 
