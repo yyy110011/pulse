@@ -532,8 +532,8 @@ fn draw_sidebar(
         return;
     }
 
-    // --- Determine how many rows go to the footer (search/goto input + suggestions) ---
-    let footer_lines: usize = if fb.goto_mode {
+    // --- Determine how many rows go to the header (search/goto input + suggestions) ---
+    let header_lines: usize = if fb.goto_mode {
         // 1 for the input line + up to N suggestion rows
         1 + fb.goto_suggestions.len().min(6)
     } else if fb.search_mode {
@@ -542,7 +542,7 @@ fn draw_sidebar(
         0
     };
 
-    let entries_height = (inner.height as usize).saturating_sub(footer_lines);
+    let entries_height = (inner.height as usize).saturating_sub(header_lines);
 
     // --- Build filtered entry list ---
     let search_lower = if fb.search_mode && !fb.search_query.is_empty() {
@@ -573,6 +573,39 @@ fn draw_sidebar(
         return;
     }
 
+    // --- Header: search input, goto input + suggestions (rendered at top) ---
+    let mut all_lines: Vec<Line> = Vec::new();
+
+    if fb.search_mode {
+        all_lines.push(Line::from(Span::styled(
+            format!("🔍 {}_", fb.search_query),
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if fb.goto_mode {
+        all_lines.push(Line::from(Span::styled(
+            format!("📂 {}_", fb.goto_path),
+            Style::default().fg(Color::Yellow),
+        )));
+        // Suggestion dropdown directly below input
+        for (si, suggestion) in fb.goto_suggestions.iter().take(6).enumerate() {
+            let suffix = if suggestion.is_dir { "/" } else { "" };
+            let style = if si == fb.goto_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if suggestion.is_dir {
+                Style::default().fg(Color::Blue)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            all_lines.push(Line::from(Span::styled(
+                format!("  {}{}", suggestion.name, suffix),
+                style,
+            )));
+        }
+    }
+
     // Compute visible window around selected item
     let total = filtered_entries.len();
     let selected = fb.selected;
@@ -587,63 +620,32 @@ fn draw_sidebar(
         selected.saturating_sub(entries_height / 2)
     };
 
-    let mut entry_lines: Vec<Line> = filtered_entries
+    // Append entry lines after the header
+    for (i, entry) in filtered_entries
         .iter()
         .skip(scroll_offset)
         .take(entries_height)
-        .map(|(i, entry)| {
-            let icon = if entry.is_dir { "📁 " } else { "📄 " };
-            let name = &entry.name;
-            let style = if *i == selected && is_active {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if *i == selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if entry.is_dir {
-                Style::default().fg(Color::Blue)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            Line::from(Span::styled(format!("{icon}{name}"), style))
-        })
-        .collect();
-
-    // --- Footer: search input, goto input + suggestions ---
-    if fb.search_mode {
-        entry_lines.push(Line::from(Span::styled(
-            format!("🔍 {}_", fb.search_query),
-            Style::default().fg(Color::Yellow),
-        )));
-    } else if fb.goto_mode {
-        entry_lines.push(Line::from(Span::styled(
-            format!("📂 {}_", fb.goto_path),
-            Style::default().fg(Color::Yellow),
-        )));
-        // Suggestion dropdown
-        for (si, suggestion) in fb.goto_suggestions.iter().take(6).enumerate() {
-            let suffix = if suggestion.is_dir { "/" } else { "" };
-            let style = if si == fb.goto_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else if suggestion.is_dir {
-                Style::default().fg(Color::Blue)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            entry_lines.push(Line::from(Span::styled(
-                format!("  {}{}", suggestion.name, suffix),
-                style,
-            )));
-        }
+    {
+        let icon = if entry.is_dir { "📁 " } else { "📄 " };
+        let name = &entry.name;
+        let style = if *i == selected && is_active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if *i == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if entry.is_dir {
+            Style::default().fg(Color::Blue)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        all_lines.push(Line::from(Span::styled(format!("{icon}{name}"), style)));
     }
 
-    frame.render_widget(Paragraph::new(entry_lines), inner);
+    frame.render_widget(Paragraph::new(all_lines), inner);
 }
 
 // ─── Helper: Disk Info Panel ───
