@@ -300,19 +300,35 @@ async fn try_key_auth(
     for key_path in &key_paths {
         let path = std::path::Path::new(key_path);
         if !path.exists() {
+            eprintln!("[DEBUG] Key not found: {key_path}");
             continue;
         }
 
+        eprintln!("[DEBUG] Trying key: {key_path}");
         // Use russh::keys to load (same crate that russh uses internally)
         match russh::keys::load_secret_key(key_path, None) {
             Ok(key) => {
+                eprintln!("[DEBUG] Key loaded OK, authenticating...");
                 let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
                 match session.authenticate_publickey(user, key_with_hash).await {
-                    Ok(result) if result.success() => return true,
-                    _ => continue,
+                    Ok(result) if result.success() => {
+                        eprintln!("[DEBUG] Key auth SUCCESS");
+                        return true;
+                    }
+                    Ok(_) => {
+                        eprintln!("[DEBUG] Key auth returned but not success");
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[DEBUG] Key auth error: {e}");
+                        continue;
+                    }
                 }
             }
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("[DEBUG] Key load error: {e}");
+                continue;
+            }
         }
     }
 
