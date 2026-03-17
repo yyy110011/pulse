@@ -5,8 +5,11 @@ use russh::client;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::ChannelMsg;
 
+use crate::disk_info::{self, DiskEntry};
 use crate::metrics::{self, MetricsData};
+use crate::process_info::{self, ProcessEntry};
 use crate::ssh_config::SshHost;
+use crate::system_info::{self, SystemInfo};
 
 /// State of an SSH session.
 #[derive(Debug, Clone)]
@@ -45,6 +48,14 @@ pub struct SessionData {
     pub input_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     /// Real-time system metrics collected over SSH.
     pub metrics: MetricsData,
+    /// Static system info (collected once on connect).
+    pub system_info: Option<SystemInfo>,
+    /// Disk usage entries (collected every 10s).
+    pub disks: Option<Vec<DiskEntry>>,
+    /// Whether disk data is currently being collected.
+    pub disk_loading: bool,
+    /// Top processes by CPU (collected every 2s).
+    pub processes: Option<Vec<ProcessEntry>>,
 }
 
 impl SessionData {
@@ -55,6 +66,10 @@ impl SessionData {
             host,
             input_tx: None,
             metrics: MetricsData::new(),
+            system_info: None,
+            disks: None,
+            disk_loading: false,
+            processes: None,
         }
     }
 }
@@ -166,7 +181,12 @@ async fn run_session(session_data: SharedSession, rt: tokio::runtime::Handle) ->
     let shared_handle = Arc::new(Mutex::new(session));
 
     // Spawn metrics collector on separate channels
-    metrics::spawn_metrics_collector(shared_handle, session_data.clone(), rt);
+    metrics::spawn_metrics_collector(shared_handle.clone(), session_data.clone(), rt.clone());
+
+    // Spawn host info collectors
+    system_info::spawn_system_info_collector(shared_handle.clone(), session_data.clone(), rt.clone());
+    disk_info::spawn_disk_collector(shared_handle.clone(), session_data.clone(), rt.clone());
+    process_info::spawn_process_collector(shared_handle, session_data.clone(), rt);
 
     // Set up input channel
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();

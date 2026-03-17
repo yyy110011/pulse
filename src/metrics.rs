@@ -217,8 +217,8 @@ fn parse_net_dev(content: &str, prev_bytes: &mut Option<u64>) -> Option<f64> {
 use russh::client;
 use crate::session::SshClientHandler;
 
-type SharedHandle = Arc<Mutex<client::Handle<SshClientHandler>>>;
-type SharedSession = Arc<Mutex<SessionData>>;
+pub type SharedHandle = Arc<Mutex<client::Handle<SshClientHandler>>>;
+pub type SharedSession = Arc<Mutex<SessionData>>;
 
 /// Spawn a background task that periodically collects metrics via SSH.
 pub fn spawn_metrics_collector(
@@ -263,7 +263,7 @@ pub fn spawn_metrics_collector(
 }
 
 /// Execute a command on the remote host via a new channel and return stdout.
-async fn exec_remote_cmd(handle: &SharedHandle, cmd: &str) -> Option<String> {
+pub async fn exec_remote_cmd(handle: &SharedHandle, cmd: &str) -> Option<String> {
     let mut channel = {
         let h = handle.lock().await;
         h.channel_open_session().await.ok()?

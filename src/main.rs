@@ -1,7 +1,10 @@
 mod dashboard;
+mod disk_info;
 mod metrics;
+mod process_info;
 mod session;
 mod ssh_config;
+mod system_info;
 mod ui;
 
 use std::io;
