@@ -1,6 +1,7 @@
 mod dashboard;
 mod disk_info;
 mod file_browser;
+mod grid_layout;
 mod metrics;
 mod process_info;
 mod session;
@@ -12,7 +13,7 @@ use std::io;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use dashboard::Dashboard;
+use dashboard::{Dashboard, NavDirection};
 use metrics::MetricType;
 use session::SessionState;
 use ssh_config::parse_ssh_config;
@@ -35,7 +36,7 @@ fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
     let size = terminal.size().unwrap_or_default();
 
-    // Calculate grid columns based on host count
+    // Calculate grid columns based on host count (used as hint for initial layout)
     let cols = if hosts.len() <= 3 {
         hosts.len().max(1)
     } else if hosts.len() <= 8 {
@@ -69,6 +70,9 @@ fn run_app(
             break;
         }
 
+        // Tick shake animation each loop iteration
+        dashboard.tick_shake();
+
         // Short poll timeout for responsive UI updates
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
@@ -89,11 +93,18 @@ fn handle_input(
     modifiers: KeyModifiers,
     rt: &tokio::runtime::Runtime,
 ) -> bool {
-    if let Some(idx) = dashboard.focused {
+    if let Some((row, col)) = dashboard.focused {
         // === Focused mode ===
+        let session = match dashboard.session_at(row, col) {
+            Some(s) => s.clone(),
+            None => {
+                dashboard.unfocus();
+                return false;
+            }
+        };
 
         let state = rt.block_on(async {
-            let data = dashboard.sessions[idx].lock().await;
+            let data = session.lock().await;
             data.state.clone()
         });
 
@@ -120,11 +131,10 @@ fn handle_input(
                 }
             }
             SessionState::Connected => {
-                use crate::dashboard::{FocusPanel, FocusState, NavDirection};
+                use crate::dashboard::{FocusPanel, FocusState};
 
                 match dashboard.focus_state {
                     FocusState::PanelSelect => {
-                        // Arrow keys / hjkl move between panels
                         match code {
                             KeyCode::Up | KeyCode::Char('k') => dashboard.move_focus(NavDirection::Up),
                             KeyCode::Down | KeyCode::Char('j') => dashboard.move_focus(NavDirection::Down),
@@ -146,23 +156,18 @@ fn handle_input(
                                     dashboard.focus_state = FocusState::PanelSelect;
                                     return false;
                                 }
-                                // All keys go to SSH
                                 let bytes = key_to_bytes(code, modifiers);
                                 if !bytes.is_empty() {
                                     rt.block_on(dashboard.send_input(bytes));
                                 }
                             }
                             FocusPanel::Sidebar => {
-                                let session = dashboard.sessions[idx].clone();
-
-                                // Check which sub-mode we're in
                                 let (in_search, in_goto) = rt.block_on(async {
                                     let data = session.lock().await;
                                     (data.file_browser.search_mode, data.file_browser.goto_mode)
                                 });
 
                                 if in_search {
-                                    // === Search mode ===
                                     match code {
                                         KeyCode::Esc => {
                                             rt.block_on(async {
@@ -171,7 +176,6 @@ fn handle_input(
                                             });
                                         }
                                         KeyCode::Enter => {
-                                            // Jump to first match, exit search
                                             rt.block_on(async {
                                                 let mut data = session.lock().await;
                                                 let query = data.file_browser.search_query.to_lowercase();
@@ -200,7 +204,6 @@ fn handle_input(
                                         _ => {}
                                     }
                                 } else if in_goto {
-                                    // === Goto mode with autocomplete ===
                                     match code {
                                         KeyCode::Esc => {
                                             rt.block_on(async {
@@ -209,7 +212,6 @@ fn handle_input(
                                             });
                                         }
                                         KeyCode::Enter => {
-                                            // Navigate to the typed path
                                             rt.block_on(async {
                                                 let (sftp_arc, goto_path) = {
                                                     let data = session.lock().await;
@@ -231,7 +233,6 @@ fn handle_input(
                                             rt.block_on(async {
                                                 let mut data = session.lock().await;
                                                 data.file_browser.autocomplete_selected();
-                                                // Refresh suggestions after autocomplete
                                                 let sftp_arc = data.sftp.clone();
                                                 drop(data);
                                                 if let Some(sftp) = sftp_arc {
@@ -295,7 +296,7 @@ fn handle_input(
                                         _ => {}
                                     }
                                 } else {
-                                    // === Normal sidebar mode ===
+                                    // Normal sidebar mode
                                     match code {
                                         KeyCode::Esc => {
                                             dashboard.focus_state = FocusState::PanelSelect;
@@ -330,7 +331,6 @@ fn handle_input(
                                             });
                                         }
                                         KeyCode::Enter | KeyCode::Right => {
-                                            // Enter directory or view file
                                             rt.block_on(async {
                                                 let (sftp_arc, selected, is_dir) = {
                                                     let data = session.lock().await;
@@ -351,7 +351,6 @@ fn handle_input(
                                             });
                                         }
                                         KeyCode::Left | KeyCode::Backspace => {
-                                            // Go up one directory / close file view
                                             rt.block_on(async {
                                                 let is_viewing_file = {
                                                     let data = session.lock().await;
@@ -396,6 +395,34 @@ fn handle_input(
         }
     } else {
         // === Grid mode ===
+
+        // --- Rename mode ---
+        if dashboard.rename_mode {
+            match code {
+                KeyCode::Esc => dashboard.cancel_rename(),
+                KeyCode::Enter => dashboard.confirm_rename(),
+                KeyCode::Backspace => { dashboard.rename_input.pop(); }
+                KeyCode::Char(c) => dashboard.rename_input.push(c),
+                _ => {}
+            }
+            return false;
+        }
+
+        // --- Move mode ---
+        if dashboard.move_mode {
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => { dashboard.move_host(NavDirection::Up); }
+                KeyCode::Down | KeyCode::Char('j') => { dashboard.move_host(NavDirection::Down); }
+                KeyCode::Left | KeyCode::Char('h') => { dashboard.move_host(NavDirection::Left); }
+                KeyCode::Right | KeyCode::Char('l') => { dashboard.move_host(NavDirection::Right); }
+                KeyCode::Enter => dashboard.confirm_move(),
+                KeyCode::Esc => dashboard.cancel_move(rt.handle()),
+                _ => {}
+            }
+            return false;
+        }
+
+        // --- Normal grid mode ---
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Up | KeyCode::Char('k') => dashboard.move_up(),
@@ -403,6 +430,10 @@ fn handle_input(
             KeyCode::Left | KeyCode::Char('h') => dashboard.move_left(),
             KeyCode::Right | KeyCode::Char('l') => dashboard.move_right(),
             KeyCode::Enter => dashboard.focus(rt.handle()),
+            KeyCode::Char(' ') => dashboard.enter_move_mode(),
+            KeyCode::Char('r') => dashboard.enter_rename_mode(),
+            KeyCode::Char('m') => dashboard.hide_host(),
+            KeyCode::Char('H') => dashboard.toggle_hidden(),
             KeyCode::Tab => dashboard.cycle_metric(),
             KeyCode::Char('1') => dashboard.set_metric(MetricType::Cpu),
             KeyCode::Char('2') => dashboard.set_metric(MetricType::Memory),

@@ -13,7 +13,7 @@ use crate::session::SessionState;
 /// Draw the dashboard view.
 pub fn draw(frame: &mut Frame, dashboard: &Dashboard, rt: &tokio::runtime::Handle) {
     match dashboard.focused {
-        Some(idx) => draw_focused(frame, dashboard, idx, rt),
+        Some((row, col)) => draw_focused(frame, dashboard, row, col, rt),
         None => draw_grid(frame, dashboard, rt),
     }
 }
@@ -30,64 +30,197 @@ fn draw_grid(frame: &mut Frame, dashboard: &Dashboard, rt: &tokio::runtime::Hand
     let grid_area = main_chunks[0];
     let status_area = main_chunks[1];
 
-    let rows = dashboard.rows();
-    let cols = dashboard.cols;
+    // Count total visual rows: each DashboardRow gets a header line (1) + tile row (remaining)
+    let num_rows = dashboard.rows.len();
+    let has_hidden = dashboard.show_hidden && !dashboard.hidden_hosts.is_empty();
 
-    // Create row constraints
-    let row_constraints: Vec<Constraint> = (0..rows)
-        .map(|_| Constraint::Ratio(1, rows as u32))
-        .collect();
+    // Each row gets: 1 line for header + equal share of remaining height for tiles
+    let total_sections = num_rows + if has_hidden { 1 } else { 0 };
+    if total_sections == 0 {
+        // Nothing to render
+        let status = Line::from(Span::styled(
+            " No hosts configured. q Quit",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(status), status_area);
+        return;
+    }
 
-    let row_chunks = Layout::default()
+    // Build constraints: for each row, header(1) + tiles(ratio)
+    let mut constraints: Vec<Constraint> = Vec::new();
+    for _ in 0..num_rows {
+        constraints.push(Constraint::Length(1)); // row header
+        constraints.push(Constraint::Ratio(1, total_sections as u32)); // tiles
+    }
+    if has_hidden {
+        constraints.push(Constraint::Length(1)); // hidden header
+        constraints.push(Constraint::Ratio(1, total_sections as u32)); // hidden tiles
+    }
+
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(row_constraints)
+        .constraints(constraints)
         .split(grid_area);
 
-    for row in 0..rows {
-        let items_in_row = if (row + 1) * cols <= dashboard.total() {
-            cols
+    // Render each dashboard row
+    for (row_idx, dash_row) in dashboard.rows.iter().enumerate() {
+        let header_area = chunks[row_idx * 2];
+        let tiles_area = chunks[row_idx * 2 + 1];
+
+        // --- Row header ---
+        let is_renaming = dashboard.rename_mode && dashboard.selected_row == row_idx;
+        let header_text = if is_renaming {
+            format!(" Row name: {}_ ", dashboard.rename_input)
         } else {
-            dashboard.total() - row * cols
+            let name = &dash_row.name;
+            let count = dash_row.hosts.len();
+            format!("── {name} ({count}) ──")
         };
 
-        let col_constraints: Vec<Constraint> = (0..items_in_row)
+        let header_style = if is_renaming {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if dashboard.selected_row == row_idx && !dashboard.in_hidden_section {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(header_text, header_style))),
+            header_area,
+        );
+
+        // --- Tiles in this row ---
+        if dash_row.hosts.is_empty() {
+            continue;
+        }
+
+        let cols = dash_row.hosts.len();
+        let col_constraints: Vec<Constraint> = (0..cols)
             .map(|_| Constraint::Ratio(1, cols as u32))
             .collect();
 
         let col_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(col_constraints)
-            .split(row_chunks[row]);
+            .split(tiles_area);
 
-        for col in 0..items_in_row {
-            let idx = row * cols + col;
-            let is_selected = idx == dashboard.selected;
-            draw_tile(frame, dashboard, idx, is_selected, col_chunks[col], rt);
+        for (col_idx, session) in dash_row.hosts.iter().enumerate() {
+            let is_selected = !dashboard.in_hidden_section
+                && dashboard.selected_row == row_idx
+                && dashboard.selected_col == col_idx;
+
+            let is_moving = dashboard.move_mode && is_selected;
+
+            // Shake: check if this tile is the moving host and shake is active for this row
+            let is_shaking = dashboard.move_mode
+                && is_selected
+                && dashboard.shake_frame.as_ref().is_some_and(|(_, counter)| *counter > 0);
+
+            draw_tile(
+                frame,
+                session,
+                dashboard,
+                is_selected,
+                is_moving,
+                is_shaking,
+                col_chunks[col_idx],
+                rt,
+            );
+        }
+    }
+
+    // --- Hidden section ---
+    if has_hidden {
+        let hidden_header_idx = num_rows * 2;
+        let hidden_tiles_idx = hidden_header_idx + 1;
+        let hidden_header_area = chunks[hidden_header_idx];
+        let hidden_tiles_area = chunks[hidden_tiles_idx];
+
+        let hidden_count = dashboard.hidden_hosts.len();
+        let arrow = if dashboard.show_hidden { "▾" } else { "▸" };
+        let header_style = if dashboard.in_hidden_section {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("─── Hidden ({hidden_count}) {arrow} ───"),
+                header_style,
+            ))),
+            hidden_header_area,
+        );
+
+        // Render hidden host tiles
+        let cols = dashboard.hidden_hosts.len();
+        if cols > 0 {
+            let col_constraints: Vec<Constraint> = (0..cols)
+                .map(|_| Constraint::Ratio(1, cols as u32))
+                .collect();
+
+            let col_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(col_constraints)
+                .split(hidden_tiles_area);
+
+            for (i, session) in dashboard.hidden_hosts.iter().enumerate() {
+                let is_selected = dashboard.in_hidden_section && dashboard.hidden_selected == i;
+                draw_tile(
+                    frame,
+                    session,
+                    dashboard,
+                    is_selected,
+                    false,
+                    false,
+                    col_chunks[i],
+                    rt,
+                );
+            }
         }
     }
 
     // Status bar
-    let metric_label = dashboard.active_metric.to_string();
-    let status = Line::from(vec![
-        Span::styled(
-            format!(" ↑↓←→ Navigate  Enter Focus  Tab/{metric_label}  1 CPU  2 MEM  3 NET  q Quit"),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+    let status = if dashboard.rename_mode {
+        Line::from(vec![
+            Span::styled(" Type name  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("Enter ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Confirm  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else if dashboard.move_mode {
+        Line::from(vec![
+            Span::styled(" ↑↓←→ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("Move  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Place  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        let metric_label = dashboard.active_metric.to_string();
+        Line::from(vec![
+            Span::styled(
+                format!(" ↑↓←→ Navigate  Enter Focus  Space Move  r Rename  m Hide  H Hidden  Tab/{metric_label}  q Quit"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    };
     frame.render_widget(Paragraph::new(status), status_area);
 }
 
 fn draw_tile(
     frame: &mut Frame,
+    session: &crate::session::SharedSession,
     dashboard: &Dashboard,
-    idx: usize,
     is_selected: bool,
+    is_moving: bool,
+    is_shaking: bool,
     area: Rect,
     rt: &tokio::runtime::Handle,
 ) {
-    let session = &dashboard.sessions[idx];
-
-    // Block on the async lock briefly - this is fine for UI rendering
     let data = rt.block_on(session.lock());
 
     let (state_icon, state_color) = match &data.state {
@@ -99,7 +232,16 @@ fn draw_tile(
         SessionState::Disconnected(_) => ("●", Color::Red),
     };
 
-    let border_color = if is_selected {
+    let border_color = if is_shaking {
+        // Shake: alternate Red/Normal based on counter parity
+        if let Some((_, counter)) = dashboard.shake_frame {
+            if counter % 2 == 1 { Color::Red } else { Color::Yellow }
+        } else {
+            Color::Yellow
+        }
+    } else if is_moving {
+        Color::Yellow
+    } else if is_selected {
         Color::Cyan
     } else {
         match &data.state {
@@ -109,23 +251,23 @@ fn draw_tile(
         }
     };
 
-    let border_style = if is_selected {
+    let border_style = if is_selected || is_moving {
         Style::default().fg(border_color).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(border_color)
     };
 
-    let title = format!(
-        " {state_icon} {} ",
-        data.host.name,
-    );
+    let title_icon = if is_moving { "✦" } else { state_icon };
+    let title = format!(" {title_icon} {} ", data.host.name);
+
+    let title_color = if is_moving { Color::Yellow } else { state_color };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(Span::styled(
             title,
-            Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
@@ -144,7 +286,6 @@ fn draw_tile(
                 MetricType::Network => Color::Yellow,
             };
 
-            // Header: metric name + current value
             let value_str = match latest {
                 Some(v) => {
                     if matches!(metric, MetricType::Network) {
@@ -161,14 +302,10 @@ fn draw_tile(
                     format!("{metric} "),
                     Style::default().fg(metric_color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    value_str,
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(value_str, Style::default().fg(Color::White)),
             ]);
             let header_paragraph = Paragraph::new(header);
 
-            // Split inner area: 1 line for header, rest for sparkline
             let inner_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -176,13 +313,12 @@ fn draw_tile(
 
             frame.render_widget(header_paragraph, inner_chunks[0]);
 
-            // Convert VecDeque<f64> to Vec<u64> for Sparkline
             let spark_data: Vec<u64> = series.iter().map(|v| *v as u64).collect();
             let sparkline = Sparkline::default()
                 .data(&spark_data)
                 .style(Style::default().fg(metric_color));
             frame.render_widget(sparkline, inner_chunks[1]);
-            return; // We've rendered the tile contents manually
+            return;
         }
         SessionState::NeedPassword => {
             vec![
@@ -236,11 +372,15 @@ fn draw_tile(
 fn draw_focused(
     frame: &mut Frame,
     dashboard: &Dashboard,
-    idx: usize,
+    row: usize,
+    col: usize,
     rt: &tokio::runtime::Handle,
 ) {
     let area = frame.area();
-    let session = &dashboard.sessions[idx];
+    let session = match dashboard.session_at(row, col) {
+        Some(s) => s,
+        None => return,
+    };
     let data = rt.block_on(session.lock());
 
     let (state_icon, state_color) = match &data.state {
@@ -250,7 +390,7 @@ fn draw_focused(
         _ => ("◌", Color::Yellow),
     };
 
-    // --- Non-connected states: full-area rendering (unchanged) ---
+    // --- Non-connected states: full-area rendering ---
     if !data.state.is_connected() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -325,13 +465,11 @@ fn draw_focused(
 
     // === Connected state: multi-panel layout ===
 
-    // Outer vertical: top content (70%) | bottom terminal+status (30%)
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(area);
 
-    // --- Top area: sidebar (20%) | right panels (80%) ---
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
@@ -340,7 +478,6 @@ fn draw_focused(
     let sidebar_area = top_cols[0];
     let right_area = top_cols[1];
 
-    // Right area: info row (4 lines) | main panel (remaining)
     let right_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
@@ -349,7 +486,6 @@ fn draw_focused(
     let info_row = right_rows[0];
     let main_panel_area = right_rows[1];
 
-    // Info row: disk (50%) | system (50%)
     let info_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -358,7 +494,6 @@ fn draw_focused(
     let disk_area = info_cols[0];
     let sysinfo_area = info_cols[1];
 
-    // Bottom: terminal | status bar
     let bottom_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -367,7 +502,6 @@ fn draw_focused(
     let terminal_area = bottom_rows[0];
     let status_area = bottom_rows[1];
 
-    // Determine border color for each panel based on focus state
     let panel_border = |panel: FocusPanel| -> Color {
         if dashboard.focus_panel == panel {
             match dashboard.focus_state {
@@ -391,7 +525,7 @@ fn draw_focused(
     // ─── System Info Panel ───
     draw_sysinfo_panel(frame, &data.system_info, &data.host.name, sysinfo_area, panel_border(FocusPanel::SysInfo), panel_title_bold(FocusPanel::SysInfo));
 
-    // ─── Main Panel (process viewer or file content) ───
+    // ─── Main Panel ───
     draw_main_panel(frame, &data, main_panel_area, panel_border(FocusPanel::Main), panel_title_bold(FocusPanel::Main));
 
     // ─── Terminal Pane ───
@@ -414,7 +548,6 @@ fn draw_focused(
         let pane_rows = term_inner.height as usize;
         let total_rows = screen.size().0 as usize;
 
-        // Find last row with actual content (prompt is at top, not bottom)
         let mut last_content_row = 0;
         for r in (0..total_rows).rev() {
             let r16 = r as u16;
@@ -487,7 +620,6 @@ fn draw_sidebar(
     border_color: Color,
     is_active: bool,
 ) {
-    // Shorten path for title
     let path_display = if fb.current_path.len() > (area.width as usize).saturating_sub(4) {
         let parts: Vec<&str> = fb.current_path.rsplitn(2, '/').collect();
         if parts.len() > 1 {
@@ -532,19 +664,16 @@ fn draw_sidebar(
         return;
     }
 
-    // --- Determine how many rows go to the header (search/goto input + suggestions) ---
     let header_lines: usize = if fb.goto_mode {
-        // 1 for the input line + up to N suggestion rows
         1 + fb.goto_suggestions.len().min(6)
     } else if fb.search_mode {
-        1 // search input line
+        1
     } else {
         0
     };
 
     let entries_height = (inner.height as usize).saturating_sub(header_lines);
 
-    // --- Build filtered entry list ---
     let search_lower = if fb.search_mode && !fb.search_query.is_empty() {
         Some(fb.search_query.to_lowercase())
     } else {
@@ -573,7 +702,6 @@ fn draw_sidebar(
         return;
     }
 
-    // --- Header: search input, goto input + suggestions (rendered at top) ---
     let mut all_lines: Vec<Line> = Vec::new();
 
     if fb.search_mode {
@@ -586,7 +714,6 @@ fn draw_sidebar(
             format!("📂 {}_", fb.goto_path),
             Style::default().fg(Color::Yellow),
         )));
-        // Suggestion dropdown directly below input
         for (si, suggestion) in fb.goto_suggestions.iter().take(6).enumerate() {
             let suffix = if suggestion.is_dir { "/" } else { "" };
             let style = if si == fb.goto_selected {
@@ -606,7 +733,6 @@ fn draw_sidebar(
         }
     }
 
-    // Compute visible window around selected item
     let total = filtered_entries.len();
     let selected = fb.selected;
 
@@ -620,7 +746,6 @@ fn draw_sidebar(
         selected.saturating_sub(entries_height / 2)
     };
 
-    // Append entry lines after the header
     for (i, entry) in filtered_entries
         .iter()
         .skip(scroll_offset)
@@ -699,7 +824,6 @@ fn draw_disk_panel(
                 Color::Red
             };
 
-            // Build a small bar: width ~8 chars
             let bar_width = 8usize;
             let filled = ((d.percent as usize) * bar_width / 100).min(bar_width);
             let empty = bar_width - filled;
@@ -801,7 +925,6 @@ fn draw_main_panel(
     } else {
         Style::default().fg(Color::White)
     };
-    // If viewing a file, show file content
     if let Some(filename) = &data.file_browser.viewing_file {
         let file_title_style = if title_bold {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
@@ -838,7 +961,6 @@ fn draw_main_panel(
         return;
     }
 
-    // Default: process viewer with metrics bars
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
@@ -846,13 +968,11 @@ fn draw_main_panel(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Split: metrics bars (2 lines) | process table (remaining)
     let inner_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(inner);
 
-    // Metrics bars
     let cpu_val = data.metrics.latest(MetricType::Cpu).unwrap_or(0.0);
     let mem_val = data.metrics.latest(MetricType::Memory).unwrap_or(0.0);
 
@@ -882,7 +1002,6 @@ fn draw_main_panel(
     ];
     frame.render_widget(Paragraph::new(metrics_lines), inner_rows[0]);
 
-    // Process table
     let Some(processes) = &data.processes else {
         let lines = vec![Line::from(Span::styled(
             "⏳ Collecting processes...",
@@ -894,7 +1013,6 @@ fn draw_main_panel(
 
     let mut proc_lines: Vec<Line> = Vec::new();
 
-    // Header
     proc_lines.push(Line::from(Span::styled(
         format!(
             " {:<7} {:<10} {:>5} {:>5}  {}",
@@ -903,8 +1021,7 @@ fn draw_main_panel(
         Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
     )));
 
-    // Rows
-    let max_rows = (inner_rows[1].height as usize).saturating_sub(1); // 1 for header
+    let max_rows = (inner_rows[1].height as usize).saturating_sub(1);
     for proc in processes.iter().take(max_rows) {
         let cmd_maxlen = (inner_rows[1].width as usize).saturating_sub(32);
         let cmd_display = if proc.command.len() > cmd_maxlen {
