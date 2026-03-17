@@ -300,35 +300,34 @@ async fn try_key_auth(
     for key_path in &key_paths {
         let path = std::path::Path::new(key_path);
         if !path.exists() {
-            eprintln!("[DEBUG] Key not found: {key_path}");
             continue;
         }
 
-        eprintln!("[DEBUG] Trying key: {key_path}");
-        // Use russh::keys to load (same crate that russh uses internally)
         match russh::keys::load_secret_key(key_path, None) {
             Ok(key) => {
-                eprintln!("[DEBUG] Key loaded OK, authenticating...");
-                let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
-                match session.authenticate_publickey(user, key_with_hash).await {
-                    Ok(result) if result.success() => {
-                        eprintln!("[DEBUG] Key auth SUCCESS");
-                        return true;
-                    }
-                    Ok(_) => {
-                        eprintln!("[DEBUG] Key auth returned but not success");
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("[DEBUG] Key auth error: {e}");
-                        continue;
+                let key = Arc::new(key);
+
+                // For RSA keys, modern servers reject SHA-1 (default).
+                // Try rsa-sha2-256, rsa-sha2-512, then fallback to default (None).
+                let hash_algs: Vec<Option<russh::keys::HashAlg>> = if key.algorithm().is_rsa() {
+                    vec![
+                        Some(russh::keys::HashAlg::Sha256),
+                        Some(russh::keys::HashAlg::Sha512),
+                        None,
+                    ]
+                } else {
+                    vec![None]
+                };
+
+                for hash_alg in hash_algs {
+                    let key_with_hash = PrivateKeyWithHashAlg::new(key.clone(), hash_alg);
+                    match session.authenticate_publickey(user, key_with_hash).await {
+                        Ok(result) if result.success() => return true,
+                        _ => continue,
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("[DEBUG] Key load error: {e}");
-                continue;
-            }
+            Err(_) => continue,
         }
     }
 
