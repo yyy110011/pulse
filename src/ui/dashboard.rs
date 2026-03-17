@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::dashboard::Dashboard;
+use crate::dashboard::{ActivePanel, Dashboard};
 use crate::metrics::MetricType;
 use crate::session::SessionState;
 
@@ -243,12 +243,6 @@ fn draw_focused(
     let session = &dashboard.sessions[idx];
     let data = rt.block_on(session.lock());
 
-    // Layout: terminal + status bar
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-
     let (state_icon, state_color) = match &data.state {
         SessionState::Connected => ("●", Color::Green),
         SessionState::NeedPassword => ("⚷", Color::Yellow),
@@ -256,92 +250,547 @@ fn draw_focused(
         _ => ("◌", Color::Yellow),
     };
 
-    let title = format!(
-        " {state_icon} {} — {} ",
-        data.host.name,
-        data.host.display_connection(),
-    );
+    // --- Non-connected states: full-area rendering (unchanged) ---
+    if !data.state.is_connected() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(area);
+
+        let title = format!(
+            " {state_icon} {} — {} ",
+            data.host.name,
+            data.host.display_connection(),
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(state_color))
+            .title(Span::styled(
+                title,
+                Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(chunks[0]);
+        frame.render_widget(block, chunks[0]);
+
+        match &data.state {
+            SessionState::NeedPassword => {
+                let password_display = if dashboard.entering_password {
+                    format!("Password: {}", "*".repeat(dashboard.password_input.len()))
+                } else {
+                    "Press any key to enter password...".to_string()
+                };
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Authentication required",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        password_display,
+                        Style::default().fg(Color::White),
+                    )),
+                ];
+                frame.render_widget(Paragraph::new(lines), inner);
+            }
+            SessionState::Disconnected(msg) => {
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("✗ Disconnected: {msg}"),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                ];
+                frame.render_widget(Paragraph::new(lines), inner);
+            }
+            _ => {
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        data.state.label(),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ];
+                frame.render_widget(Paragraph::new(lines), inner);
+            }
+        }
+
+        let status = Line::from(Span::styled(
+            " Esc Back",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(status), chunks[1]);
+        return;
+    }
+
+    // === Connected state: multi-panel layout ===
+
+    // Outer vertical: top content (70%) | bottom terminal+status (30%)
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(area);
+
+    // --- Top area: sidebar (20%) | right panels (80%) ---
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
+        .split(outer[0]);
+
+    let sidebar_area = top_cols[0];
+    let right_area = top_cols[1];
+
+    // Right area: info row (4 lines) | main panel (remaining)
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(right_area);
+
+    let info_row = right_rows[0];
+    let main_panel_area = right_rows[1];
+
+    // Info row: disk (50%) | system (50%)
+    let info_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(info_row);
+
+    let disk_area = info_cols[0];
+    let sysinfo_area = info_cols[1];
+
+    // Bottom: terminal | status bar
+    let bottom_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(outer[1]);
+
+    let terminal_area = bottom_rows[0];
+    let status_area = bottom_rows[1];
+
+    // ─── File Browser Sidebar ───
+    draw_sidebar(frame, &data.file_browser, sidebar_area, dashboard.active_panel == ActivePanel::Sidebar);
+
+    // ─── Disk Info Panel ───
+    draw_disk_panel(frame, &data.disks, data.disk_loading, disk_area);
+
+    // ─── System Info Panel ───
+    draw_sysinfo_panel(frame, &data.system_info, &data.host.name, sysinfo_area);
+
+    // ─── Main Panel (process viewer or file content) ───
+    draw_main_panel(frame, &data, main_panel_area);
+
+    // ─── Terminal Pane ───
+    {
+        let term_title = format!(" {state_icon} Terminal ");
+        let term_border_color = if dashboard.active_panel == ActivePanel::Terminal {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        let term_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(term_border_color))
+            .title(Span::styled(
+                term_title,
+                Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+            ));
+        let term_inner = term_block.inner(terminal_area);
+        frame.render_widget(term_block, terminal_area);
+
+        let screen = data.screen.screen();
+        let rows = term_inner.height as usize;
+        let total_rows = screen.size().0 as usize;
+        let start = if total_rows > rows { total_rows - rows } else { 0 };
+
+        let lines: Vec<Line> = (start..total_rows)
+            .map(|r| {
+                let r16 = r as u16;
+                let content = screen.contents_between(r16, 0, r16 + 1, 0);
+                Line::from(Span::styled(content, Style::default().fg(Color::White)))
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), term_inner);
+    }
+
+    // ─── Status Bar ───
+    let panel_label = match dashboard.active_panel {
+        ActivePanel::Terminal => "Terminal",
+        ActivePanel::Sidebar => "Sidebar",
+    };
+    let status = Line::from(vec![
+        Span::styled(" Tab ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("Panels  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("Back  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("↑↓ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("Navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("[{panel_label}]"),
+            Style::default().fg(Color::Yellow),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(status), status_area);
+}
+
+// ─── Helper: File Browser Sidebar ───
+fn draw_sidebar(
+    frame: &mut Frame,
+    fb: &crate::file_browser::FileBrowserState,
+    area: Rect,
+    is_active: bool,
+) {
+    let border_color = if is_active { Color::Cyan } else { Color::DarkGray };
+
+    // Shorten path for title
+    let path_display = if fb.current_path.len() > (area.width as usize).saturating_sub(4) {
+        let parts: Vec<&str> = fb.current_path.rsplitn(2, '/').collect();
+        if parts.len() > 1 {
+            format!("…/{}", parts[0])
+        } else {
+            fb.current_path.clone()
+        }
+    } else {
+        fb.current_path.clone()
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(state_color))
+        .border_style(Style::default().fg(border_color))
         .title(Span::styled(
-            title,
-            Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+            format!(" {path_display} "),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let inner = block.inner(chunks[0]);
-    frame.render_widget(block, chunks[0]);
-
-    match &data.state {
-        SessionState::Connected => {
-            // Render full terminal screen from vt100
-            let screen = data.screen.screen();
-            let rows = inner.height as usize;
-            let total_rows = screen.size().0 as usize;
-            let start = if total_rows > rows { total_rows - rows } else { 0 };
-
-            let lines: Vec<Line> = (start..total_rows)
-                .map(|r| {
-                    let r16 = r as u16;
-                    let content = screen.contents_between(r16, 0, r16 + 1, 0);
-                    Line::from(Span::styled(content, Style::default().fg(Color::White)))
-                })
-                .collect();
-
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
-        SessionState::NeedPassword => {
-            let password_display = if dashboard.entering_password {
-                format!("Password: {}", "*".repeat(dashboard.password_input.len()))
-            } else {
-                "Press any key to enter password...".to_string()
-            };
-
-            let lines = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Authentication required",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    password_display,
-                    Style::default().fg(Color::White),
-                )),
-            ];
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
-        SessionState::Disconnected(msg) => {
-            let lines = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("✗ Disconnected: {msg}"),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )),
-            ];
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
-        _ => {
-            let lines = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    data.state.label(),
-                    Style::default().fg(Color::Yellow),
-                )),
-            ];
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
+    if fb.loading {
+        let lines = vec![Line::from(Span::styled(
+            "⏳ Loading...",
+            Style::default().fg(Color::Yellow),
+        ))];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
     }
 
-    // Status bar
-    let status = Line::from(vec![
-        Span::styled(" Esc Back  ", Style::default().fg(Color::DarkGray)),
-        if data.state.is_connected() {
-            Span::styled("(typing sends to remote)", Style::default().fg(Color::DarkGray))
+    if let Some(err) = &fb.error {
+        let lines = vec![Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        ))];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        return;
+    }
+
+    if fb.entries.is_empty() {
+        let lines = vec![Line::from(Span::styled(
+            "(empty)",
+            Style::default().fg(Color::DarkGray),
+        ))];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    // Compute visible window around selected item
+    let visible_height = inner.height as usize;
+    let total = fb.entries.len();
+    let selected = fb.selected;
+
+    let scroll_offset = if total <= visible_height {
+        0
+    } else if selected < visible_height / 2 {
+        0
+    } else if selected + visible_height / 2 >= total {
+        total.saturating_sub(visible_height)
+    } else {
+        selected.saturating_sub(visible_height / 2)
+    };
+
+    let lines: Vec<Line> = fb
+        .entries
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|(i, entry)| {
+            let icon = if entry.is_dir { "📁 " } else { "📄 " };
+            let name = &entry.name;
+            let style = if i == selected && is_active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if i == selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if entry.is_dir {
+                Style::default().fg(Color::Blue)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(format!("{icon}{name}"), style))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// ─── Helper: Disk Info Panel ───
+fn draw_disk_panel(
+    frame: &mut Frame,
+    disks: &Option<Vec<crate::disk_info::DiskEntry>>,
+    disk_loading: bool,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Disk ",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if disk_loading && disks.is_none() {
+        let lines = vec![Line::from(Span::styled(
+            "⏳ Loading...",
+            Style::default().fg(Color::Yellow),
+        ))];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let Some(disk_entries) = disks else {
+        let lines = vec![Line::from(Span::styled(
+            "No data",
+            Style::default().fg(Color::DarkGray),
+        ))];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    };
+
+    let lines: Vec<Line> = disk_entries
+        .iter()
+        .take(inner.height as usize)
+        .map(|d| {
+            let bar_color = if d.percent < 70 {
+                Color::Green
+            } else if d.percent < 90 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+
+            // Build a small bar: width ~8 chars
+            let bar_width = 8usize;
+            let filled = ((d.percent as usize) * bar_width / 100).min(bar_width);
+            let empty = bar_width - filled;
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<6}", d.mount),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{}/{} ", d.used, d.size),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(bar, Style::default().fg(bar_color)),
+                Span::styled(
+                    format!(" {}%", d.percent),
+                    Style::default().fg(bar_color),
+                ),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// ─── Helper: System Info Panel ───
+fn draw_sysinfo_panel(
+    frame: &mut Frame,
+    sys_info: &Option<crate::system_info::SystemInfo>,
+    host_name: &str,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            format!(" {host_name} "),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(info) = sys_info else {
+        let lines = vec![Line::from(Span::styled(
+            "Collecting...",
+            Style::default().fg(Color::Yellow),
+        ))];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            info.os.clone(),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(vec![
+            Span::styled(
+                info.kernel.clone(),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("Up {}", info.uptime),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                info.cpu_info.clone(),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("RAM {}", info.ram_total),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// ─── Helper: Main Panel (process viewer or file content) ───
+fn draw_main_panel(
+    frame: &mut Frame,
+    data: &crate::session::SessionData,
+    area: Rect,
+) {
+    // If viewing a file, show file content
+    if let Some(filename) = &data.file_browser.viewing_file {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                format!(" 📄 {filename} "),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if let Some(content) = &data.file_browser.file_content {
+            let lines: Vec<Line> = content
+                .lines()
+                .enumerate()
+                .take(inner.height as usize)
+                .map(|(i, line)| {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{:>4} │ ", i + 1),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                    ])
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        return;
+    }
+
+    // Default: process viewer with metrics bars
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Main ",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Split: metrics bars (2 lines) | process table (remaining)
+    let inner_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+
+    // Metrics bars
+    let cpu_val = data.metrics.latest(MetricType::Cpu).unwrap_or(0.0);
+    let mem_val = data.metrics.latest(MetricType::Memory).unwrap_or(0.0);
+
+    let bar_width = 12usize;
+    let cpu_filled = ((cpu_val as usize) * bar_width / 100).min(bar_width);
+    let cpu_empty = bar_width - cpu_filled;
+    let mem_filled = ((mem_val as usize) * bar_width / 100).min(bar_width);
+    let mem_empty = bar_width - mem_filled;
+
+    let metrics_lines = vec![
+        Line::from(vec![
+            Span::styled(" CPU ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("█".repeat(cpu_filled), Style::default().fg(Color::Cyan)),
+            Span::styled("░".repeat(cpu_empty), Style::default().fg(Color::DarkGray)),
+            Span::styled("] ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{cpu_val:.0}%"), Style::default().fg(Color::Cyan)),
+            Span::styled("    ", Style::default()),
+            Span::styled("MEM ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("█".repeat(mem_filled), Style::default().fg(Color::Magenta)),
+            Span::styled("░".repeat(mem_empty), Style::default().fg(Color::DarkGray)),
+            Span::styled("] ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{mem_val:.0}%"), Style::default().fg(Color::Magenta)),
+        ]),
+        Line::from(""),
+    ];
+    frame.render_widget(Paragraph::new(metrics_lines), inner_rows[0]);
+
+    // Process table
+    let Some(processes) = &data.processes else {
+        let lines = vec![Line::from(Span::styled(
+            "⏳ Collecting processes...",
+            Style::default().fg(Color::Yellow),
+        ))];
+        frame.render_widget(Paragraph::new(lines), inner_rows[1]);
+        return;
+    };
+
+    let mut proc_lines: Vec<Line> = Vec::new();
+
+    // Header
+    proc_lines.push(Line::from(Span::styled(
+        format!(
+            " {:<7} {:<10} {:>5} {:>5}  {}",
+            "PID", "USER", "CPU%", "MEM%", "COMMAND"
+        ),
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+    )));
+
+    // Rows
+    let max_rows = (inner_rows[1].height as usize).saturating_sub(1); // 1 for header
+    for proc in processes.iter().take(max_rows) {
+        let cmd_maxlen = (inner_rows[1].width as usize).saturating_sub(32);
+        let cmd_display = if proc.command.len() > cmd_maxlen {
+            format!("{}…", &proc.command[..cmd_maxlen.saturating_sub(1)])
         } else {
-            Span::raw("")
-        },
-    ]);
-    frame.render_widget(Paragraph::new(status), chunks[1]);
+            proc.command.clone()
+        };
+
+        proc_lines.push(Line::from(Span::styled(
+            format!(
+                " {:<7} {:<10} {:>5.1} {:>5.1}  {}",
+                proc.pid, proc.user, proc.cpu, proc.mem, cmd_display
+            ),
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(proc_lines), inner_rows[1]);
 }

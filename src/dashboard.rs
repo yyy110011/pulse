@@ -5,6 +5,15 @@ use crate::metrics::MetricType;
 use crate::session::{self, SessionData, SharedSession};
 use crate::ssh_config::SshHost;
 
+/// Which panel is active in focused mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePanel {
+    /// Keyboard input goes to the SSH terminal.
+    Terminal,
+    /// Keyboard input navigates the file browser sidebar.
+    Sidebar,
+}
+
 /// Dashboard manages multiple SSH sessions in a grid layout.
 pub struct Dashboard {
     pub sessions: Vec<SharedSession>,
@@ -23,6 +32,8 @@ pub struct Dashboard {
     pub term_rows: u16,
     /// Which metric to display in tile sparklines.
     pub active_metric: MetricType,
+    /// Which panel is active in focused mode.
+    pub active_panel: ActivePanel,
 }
 
 impl Dashboard {
@@ -48,6 +59,7 @@ impl Dashboard {
             term_cols,
             term_rows,
             active_metric: MetricType::Cpu,
+            active_panel: ActivePanel::Terminal,
         }
     }
 
@@ -114,6 +126,7 @@ impl Dashboard {
         self.focused = None;
         self.entering_password = false;
         self.password_input.clear();
+        self.active_panel = ActivePanel::Terminal;
     }
 
     /// Send input bytes to the focused session.
@@ -147,5 +160,13 @@ impl Dashboard {
     /// Set metric directly.
     pub fn set_metric(&mut self, metric: MetricType) {
         self.active_metric = metric;
+    }
+
+    /// Toggle active panel between Terminal and Sidebar.
+    pub fn toggle_panel(&mut self) {
+        self.active_panel = match self.active_panel {
+            ActivePanel::Terminal => ActivePanel::Sidebar,
+            ActivePanel::Sidebar => ActivePanel::Terminal,
+        };
     }
 }
